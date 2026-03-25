@@ -18,6 +18,7 @@ use crate::repl::{repl_main, ReplArgs};
 use crate::server::{server_main, ServerArgs};
 
 mod api;
+mod backend;
 mod cli;
 mod client;
 mod repl;

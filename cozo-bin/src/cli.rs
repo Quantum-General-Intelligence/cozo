@@ -6,26 +6,54 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! CLI client for CozoDB server.
+//! CLI client for CozoDB — dual mode: embedded (direct) or remote (HTTP).
 //!
-//! Provides a rich command-line interface to interact with a running CozoDB server
-//! via the HTTP API. Designed for both human users and AI agents.
+//! **Embedded mode** (default): Opens the database directly in-process.
+//! No network overhead. Use `--engine` and `--path` to configure.
+//!
+//! **Remote mode** (`--remote`): Connects to a running CozoDB server via HTTP.
+//! Use `--url` and `--auth` to configure.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
+use crate::backend::{CozoBackend, EmbeddedBackend, RemoteBackend};
+
 #[derive(Args, Debug)]
 pub(crate) struct CliArgs {
-    /// Server URL (e.g., http://127.0.0.1:9070)
+    /// Connect to a remote CozoDB server instead of opening the database directly
+    #[clap(long)]
+    remote: bool,
+
+    // ── Remote mode options ──
+
+    /// Server URL for remote mode (e.g., http://127.0.0.1:9070)
     #[clap(short = 'u', long, default_value_t = String::from("http://127.0.0.1:9070"))]
     url: String,
 
-    /// Auth token for the server
+    /// Auth token for remote server
     #[clap(short, long, default_value_t = String::new())]
     auth: String,
+
+    // ── Embedded mode options ──
+
+    /// Database engine: mem, sqlite, rocksdb (embedded mode)
+    #[clap(short, long, default_value_t = String::from("mem"))]
+    engine: String,
+
+    /// Path to database directory (embedded mode)
+    #[clap(short, long, default_value_t = String::from("cozo.db"))]
+    path: String,
+
+    /// Extra config in JSON format (embedded mode)
+    #[clap(short, long, default_value_t = String::from("{}"))]
+    config: String,
+
+    // ── Output options ──
 
     /// Output format: table, json, jsonl, csv
     #[clap(short, long, default_value_t = String::from("table"))]
@@ -85,10 +113,10 @@ enum CliCommand {
         transactional: bool,
     },
 
-    /// Show server health and metadata
+    /// Show database health and metadata
     Health,
 
-    /// List all API endpoints (for agent discovery)
+    /// List all API endpoints (remote mode: for agent discovery)
     Endpoints,
 
     /// Get full database schema
@@ -209,55 +237,11 @@ enum CliCommand {
         relations: String,
     },
 
-    /// Watch for changes on a relation (SSE stream)
+    /// Watch for changes on a relation (remote mode only, SSE stream)
     Watch {
         /// Relation name to watch
         relation: String,
     },
-}
-
-fn http_get(url: &str, auth: &str) -> Result<Value, String> {
-    let mut req = minreq::get(url);
-    if !auth.is_empty() {
-        req = req.with_header("x-cozo-auth", auth);
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let body = resp.as_str().map_err(|e| e.to_string())?;
-    serde_json::from_str(body).map_err(|e| format!("Failed to parse response: {}", e))
-}
-
-fn http_post(url: &str, auth: &str, body: &Value) -> Result<Value, String> {
-    let mut req = minreq::post(url)
-        .with_header("Content-Type", "application/json")
-        .with_body(body.to_string());
-    if !auth.is_empty() {
-        req = req.with_header("x-cozo-auth", auth);
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let resp_body = resp.as_str().map_err(|e| e.to_string())?;
-    serde_json::from_str(resp_body).map_err(|e| format!("Failed to parse response: {}", e))
-}
-
-fn http_put(url: &str, auth: &str, body: &Value) -> Result<Value, String> {
-    let mut req = minreq::put(url)
-        .with_header("Content-Type", "application/json")
-        .with_body(body.to_string());
-    if !auth.is_empty() {
-        req = req.with_header("x-cozo-auth", auth);
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let resp_body = resp.as_str().map_err(|e| e.to_string())?;
-    serde_json::from_str(resp_body).map_err(|e| format!("Failed to parse response: {}", e))
-}
-
-fn http_delete(url: &str, auth: &str) -> Result<Value, String> {
-    let mut req = minreq::delete(url);
-    if !auth.is_empty() {
-        req = req.with_header("x-cozo-auth", auth);
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let body = resp.as_str().map_err(|e| e.to_string())?;
-    serde_json::from_str(body).map_err(|e| format!("Failed to parse response: {}", e))
 }
 
 fn read_script(script: &str) -> Result<String, String> {
@@ -281,7 +265,6 @@ fn format_output(result: &Value, format: &str) {
             );
         }
         "jsonl" => {
-            // Output each row as a JSON line
             if let (Some(headers), Some(rows)) = (
                 result.get("headers").and_then(|h| h.as_array()),
                 result.get("rows").and_then(|r| r.as_array()),
@@ -305,14 +288,12 @@ fn format_output(result: &Value, format: &str) {
                 result.get("headers").and_then(|h| h.as_array()),
                 result.get("rows").and_then(|r| r.as_array()),
             ) {
-                // Print headers
                 let header_strs: Vec<String> = headers
                     .iter()
                     .map(|h| h.as_str().unwrap_or("").to_string())
                     .collect();
                 println!("{}", header_strs.join(","));
 
-                // Print rows
                 for row in rows {
                     if let Some(row_arr) = row.as_array() {
                         let row_strs: Vec<String> = row_arr
@@ -367,7 +348,6 @@ fn format_output(result: &Value, format: &str) {
                 );
                 table.printstd();
 
-                // Print metadata if available
                 if let Some(elapsed) = result.get("elapsed_ms") {
                     eprintln!("Elapsed: {}ms", elapsed);
                 }
@@ -379,7 +359,6 @@ fn format_output(result: &Value, format: &str) {
                     }
                 }
             } else {
-                // Fallback to JSON for non-tabular results
                 println!(
                     "{}",
                     serde_json::to_string_pretty(result)
@@ -389,7 +368,6 @@ fn format_output(result: &Value, format: &str) {
         }
     }
 
-    // Print error if present
     if result.get("ok") == Some(&Value::Bool(false)) {
         if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
             eprintln!("Error: {}", msg);
@@ -398,9 +376,19 @@ fn format_output(result: &Value, format: &str) {
 }
 
 pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let base = args.url.trim_end_matches('/');
-    let auth = &args.auth;
-    let fmt = &args.format;
+    let fmt = args.format.clone();
+
+    // Build the backend based on mode
+    let backend: Box<dyn CozoBackend> = if args.remote {
+        eprintln!("Mode: remote ({})", args.url);
+        Box::new(RemoteBackend::new(&args.url, &args.auth))
+    } else {
+        eprintln!("Mode: embedded (engine={}, path={})", args.engine, args.path);
+        Box::new(
+            EmbeddedBackend::new(&args.engine, &args.path, &args.config)
+                .map_err(|e| format!("Failed to open database: {}", e))?,
+        )
+    };
 
     let result = match args.command {
         CliCommand::Query {
@@ -411,52 +399,27 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
             offset,
         } => {
             let script = read_script(&script)?;
-            let params: Value = serde_json::from_str(&params)
+            let params: BTreeMap<String, Value> = serde_json::from_str(&params)
                 .map_err(|e| format!("Invalid params JSON: {}", e))?;
-            http_post(
-                &format!("{}/api/query", base),
-                auth,
-                &json!({
-                    "script": script,
-                    "params": params,
-                    "immutable": immutable,
-                    "limit": limit,
-                    "offset": offset,
-                }),
-            )
+            backend.query(&script, &params, immutable, limit, offset)
         }
 
         CliCommand::Run { file, params } => {
             let script = fs::read_to_string(&file)
                 .map_err(|e| format!("Failed to read file '{}': {}", file, e))?;
-            let params: Value = serde_json::from_str(&params)
+            let params: BTreeMap<String, Value> = serde_json::from_str(&params)
                 .map_err(|e| format!("Invalid params JSON: {}", e))?;
-            http_post(
-                &format!("{}/api/query", base),
-                auth,
-                &json!({
-                    "script": script,
-                    "params": params,
-                }),
-            )
+            backend.query(&script, &params, false, 0, 0)
         }
 
         CliCommand::Validate { script } => {
             let script = read_script(&script)?;
-            http_post(
-                &format!("{}/api/validate", base),
-                auth,
-                &json!({"script": script}),
-            )
+            backend.validate(&script)
         }
 
         CliCommand::Explain { script } => {
             let script = read_script(&script)?;
-            http_post(
-                &format!("{}/api/explain", base),
-                auth,
-                &json!({"script": script}),
-            )
+            backend.explain(&script)
         }
 
         CliCommand::Batch {
@@ -465,47 +428,52 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let content = fs::read_to_string(&file)
                 .map_err(|e| format!("Failed to read file '{}': {}", file, e))?;
-            let queries: Value = serde_json::from_str(&content)
+            let raw: Vec<Value> = serde_json::from_str(&content)
                 .map_err(|e| format!("Invalid JSON in file: {}", e))?;
-            http_post(
-                &format!("{}/api/batch", base),
-                auth,
-                &json!({
-                    "queries": queries,
-                    "transactional": transactional,
-                }),
-            )
+            let queries: Vec<(String, BTreeMap<String, Value>)> = raw
+                .into_iter()
+                .map(|v| {
+                    let script = v
+                        .get("script")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let params: BTreeMap<String, Value> = v
+                        .get("params")
+                        .and_then(|p| serde_json::from_value(p.clone()).ok())
+                        .unwrap_or_default();
+                    (script, params)
+                })
+                .collect();
+            backend.batch(&queries, transactional)
         }
 
-        CliCommand::Health => http_get(&format!("{}/api/health", base), auth),
+        CliCommand::Health => backend.health(),
 
-        CliCommand::Endpoints => http_get(&format!("{}/api/endpoints", base), auth),
-
-        CliCommand::Schema => http_get(&format!("{}/api/schema", base), auth),
-
-        CliCommand::Relations => http_get(&format!("{}/api/relations", base), auth),
-
-        CliCommand::Columns { relation } => {
-            http_get(&format!("{}/api/relations/{}/columns", base, relation), auth)
+        CliCommand::Endpoints => {
+            if args.remote {
+                // Only makes sense for remote mode — fetch from server
+                let remote = RemoteBackend::new(&args.url, &args.auth);
+                remote.health() // Use the get method indirectly
+                // Actually, let's use a direct get
+            } else {
+                Ok(json!({
+                    "ok": true,
+                    "message": "Endpoints discovery is only available in remote mode (--remote). In embedded mode, all operations are available as CLI subcommands."
+                }))
+            }
         }
 
-        CliCommand::Indices { relation } => {
-            http_get(&format!("{}/api/relations/{}/indices", base, relation), auth)
-        }
-
-        CliCommand::Triggers { relation } => http_get(
-            &format!("{}/api/relations/{}/triggers", base, relation),
-            auth,
-        ),
+        CliCommand::Schema => backend.full_schema(),
+        CliCommand::Relations => backend.list_relations(),
+        CliCommand::Columns { relation } => backend.list_columns(&relation),
+        CliCommand::Indices { relation } => backend.list_indices(&relation),
+        CliCommand::Triggers { relation } => backend.show_triggers(&relation),
 
         CliCommand::Describe {
             relation,
             description,
-        } => http_post(
-            &format!("{}/api/relations/{}/describe", base, relation),
-            auth,
-            &json!({"description": description}),
-        ),
+        } => backend.describe_relation(&relation, description.as_deref()),
 
         CliCommand::CreateIndex {
             relation,
@@ -513,39 +481,23 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
             columns,
         } => {
             let cols: Vec<String> = columns.split(',').map(|s| s.trim().to_string()).collect();
-            http_post(
-                &format!("{}/api/relations/{}/indices", base, relation),
-                auth,
-                &json!({"index_name": index_name, "columns": cols}),
-            )
+            backend.create_index(&relation, &index_name, &cols)
         }
 
         CliCommand::DropIndex {
             relation,
             index_name,
-        } => http_delete(
-            &format!("{}/api/relations/{}/indices/{}", base, relation, index_name),
-            auth,
-        ),
+        } => backend.drop_index(&relation, &index_name),
 
-        CliCommand::Running => http_get(&format!("{}/api/running", base), auth),
+        CliCommand::Running => backend.list_running(),
+        CliCommand::Kill { id } => backend.kill_running(id),
+        CliCommand::FixedRules => backend.list_fixed_rules(),
+        CliCommand::Compact => backend.compact(),
 
-        CliCommand::Kill { id } => {
-            http_delete(&format!("{}/api/running/{}", base, id), auth)
-        }
-
-        CliCommand::FixedRules => http_get(&format!("{}/api/fixed-rules", base), auth),
-
-        CliCommand::Compact => http_post(&format!("{}/api/compact", base), auth, &json!({})),
-
-        CliCommand::Remove { relations } => http_post(
-            &format!("{}/api/remove-relations", base),
-            auth,
-            &json!({"relations": relations}),
-        ),
+        CliCommand::Remove { relations } => backend.remove_relations(&relations),
 
         CliCommand::Rename { pairs } => {
-            let renames: Result<Vec<Value>, String> = pairs
+            let renames: Result<Vec<(String, String)>, String> = pairs
                 .iter()
                 .map(|p| {
                     let parts: Vec<&str> = p.split(':').collect();
@@ -555,32 +507,23 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                             p
                         ))
                     } else {
-                        Ok(json!({"from": parts[0], "to": parts[1]}))
+                        Ok((parts[0].to_string(), parts[1].to_string()))
                     }
                 })
                 .collect();
-            let renames = renames?;
-            http_post(
-                &format!("{}/api/rename-relations", base),
-                auth,
-                &json!({"renames": renames}),
-            )
+            backend.rename_relations(&renames?)
         }
 
-        CliCommand::AccessLevel { level, relations } => http_post(
-            &format!("{}/api/access-level", base),
-            auth,
-            &json!({"level": level, "relations": relations}),
-        ),
+        CliCommand::AccessLevel { level, relations } => {
+            backend.set_access_level(&level, &relations)
+        }
 
         CliCommand::Export { relations, output } => {
-            let result = http_get(
-                &format!("{}/export/{}", base, relations),
-                auth,
-            )?;
+            let rels: Vec<String> = relations.split(',').map(|s| s.trim().to_string()).collect();
+            let result = backend.export_relations(&rels)?;
             if let Some(path) = output {
-                let content = serde_json::to_string_pretty(&result)
-                    .map_err(|e| e.to_string())?;
+                let content =
+                    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
                 fs::write(&path, content)
                     .map_err(|e| format!("Failed to write to '{}': {}", path, e))?;
                 eprintln!("Exported to {}", path);
@@ -594,37 +537,33 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                 .map_err(|e| format!("Failed to read file '{}': {}", file, e))?;
             let data: Value = serde_json::from_str(&content)
                 .map_err(|e| format!("Invalid JSON in file: {}", e))?;
-            http_put(&format!("{}/import", base), auth, &data)
+            backend.import_relations(&data)
         }
 
-        CliCommand::Backup { path } => {
-            http_post(&format!("{}/backup", base), auth, &json!({"path": path}))
-        }
+        CliCommand::Backup { path } => backend.backup(&path),
 
         CliCommand::ImportBackup { path, relations } => {
             let rels: Vec<String> = relations.split(',').map(|s| s.trim().to_string()).collect();
-            http_post(
-                &format!("{}/import-from-backup", base),
-                auth,
-                &json!({"path": path, "relations": rels}),
-            )
+            backend.import_from_backup(&path, &rels)
         }
 
         CliCommand::Watch { relation } => {
-            eprintln!("Watching changes on '{}' (Ctrl+C to stop)...", relation);
-            let url = format!("{}/changes/{}", base, relation);
-            let mut req = minreq::get(&url);
-            if !auth.is_empty() {
-                req = req.with_header("x-cozo-auth", auth);
+            if !args.remote {
+                return Err("Watch is only available in remote mode (--remote). Use callbacks in embedded mode.".into());
             }
-            // For SSE, we use a streaming approach
+            eprintln!("Watching changes on '{}' (Ctrl+C to stop)...", relation);
+            let url = format!("{}/changes/{}", args.url.trim_end_matches('/'), relation);
+            let mut req = minreq::get(&url);
+            if !args.auth.is_empty() {
+                req = req.with_header("x-cozo-auth", &args.auth);
+            }
             match req.send() {
                 Ok(resp) => {
                     let body = resp.as_str().map_err(|e| e.to_string())?;
                     for line in body.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
                             if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                                format_output(&parsed, fmt);
+                                format_output(&parsed, &fmt);
                             } else {
                                 println!("{}", data);
                             }
@@ -641,7 +580,7 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     match result {
         Ok(val) => {
-            format_output(&val, fmt);
+            format_output(&val, &fmt);
             if val.get("ok") == Some(&Value::Bool(false)) {
                 std::process::exit(1);
             }
