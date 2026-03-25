@@ -522,8 +522,10 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
             let rels: Vec<String> = relations.split(',').map(|s| s.trim().to_string()).collect();
             let result = backend.export_relations(&rels)?;
             if let Some(path) = output {
+                // Write only the relation data, not the wrapper
+                let export_data = result.get("data").unwrap_or(&result);
                 let content =
-                    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
+                    serde_json::to_string_pretty(export_data).map_err(|e| e.to_string())?;
                 fs::write(&path, content)
                     .map_err(|e| format!("Failed to write to '{}': {}", path, e))?;
                 eprintln!("Exported to {}", path);
@@ -535,8 +537,12 @@ pub(crate) fn cli_main(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
         CliCommand::Import { file } => {
             let content = fs::read_to_string(&file)
                 .map_err(|e| format!("Failed to read file '{}': {}", file, e))?;
-            let data: Value = serde_json::from_str(&content)
+            let mut data: Value = serde_json::from_str(&content)
                 .map_err(|e| format!("Invalid JSON in file: {}", e))?;
+            // If the file has a "data" wrapper (from export), unwrap it
+            if data.get("data").is_some() && data.get("ok").is_some() {
+                data = data["data"].take();
+            }
             backend.import_relations(&data)
         }
 

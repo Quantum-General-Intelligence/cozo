@@ -87,10 +87,14 @@ impl EmbeddedBackend {
     }
 }
 
-/// Helper: run a system command and return JSON.
+/// Helper: run a system command and return JSON with `"ok": true` added.
 fn run_sys(db: &DbInstance, script: &str) -> BackendResult {
     match db.run_script(script, BTreeMap::new(), ScriptMutability::Immutable) {
-        Ok(rows) => Ok(rows.into_json()),
+        Ok(rows) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            Ok(val)
+        }
         Err(err) => Ok(json!({"ok": false, "message": err.to_string()})),
     }
 }
@@ -141,6 +145,7 @@ impl CozoBackend for EmbeddedBackend {
 
                 let returned_rows = rows.rows.len();
                 let mut response = rows.into_json();
+                response["ok"] = json!(true);
                 response["elapsed_ms"] = json!(elapsed_ms);
                 response["total_rows"] = json!(total_rows);
                 response["returned_rows"] = json!(returned_rows);
@@ -196,7 +201,11 @@ impl CozoBackend for EmbeddedBackend {
                     .map(|(k, v)| (k.clone(), DataValue::from(v.clone())))
                     .collect();
                 match tx.run_script(script, params_dv) {
-                    Ok(rows) => results.push(rows.into_json()),
+                    Ok(rows) => {
+                        let mut val = rows.into_json();
+                        val["ok"] = json!(true);
+                        results.push(val);
+                    }
                     Err(err) => {
                         let _ = tx.abort();
                         let elapsed_ms = start.elapsed().as_millis();
@@ -235,7 +244,11 @@ impl CozoBackend for EmbeddedBackend {
                     .db
                     .run_script(script, params_dv, ScriptMutability::Mutable)
                 {
-                    Ok(rows) => results.push(rows.into_json()),
+                    Ok(rows) => {
+                        let mut val = rows.into_json();
+                        val["ok"] = json!(true);
+                        results.push(val);
+                    }
                     Err(err) => {
                         results.push(json!({"ok": false, "message": err.to_string()}))
                     }
@@ -292,7 +305,11 @@ impl CozoBackend for EmbeddedBackend {
 
     fn describe_relation(&self, relation: &str, description: Option<&str>) -> BackendResult {
         let script = if let Some(desc) = description {
-            format!("::describe {} '{}'", relation, desc.replace('\'', "\\'"))
+            format!(
+                "::describe {} \"{}\"",
+                relation,
+                desc.replace('\\', "\\\\").replace('"', "\\\"")
+            )
         } else {
             format!("::describe {}", relation)
         };
@@ -300,7 +317,11 @@ impl CozoBackend for EmbeddedBackend {
             .db
             .run_script(&script, BTreeMap::new(), ScriptMutability::Mutable)
         {
-            Ok(rows) => Ok(rows.into_json()),
+            Ok(rows) => {
+                let mut val = rows.into_json();
+                val["ok"] = json!(true);
+                Ok(val)
+            }
             Err(err) => Ok(json!({"ok": false, "message": err.to_string()})),
         }
     }
@@ -382,7 +403,11 @@ impl CozoBackend for EmbeddedBackend {
             BTreeMap::from([("id".to_string(), DataValue::from(id as i64))]),
             ScriptMutability::Mutable,
         ) {
-            Ok(rows) => Ok(rows.into_json()),
+            Ok(rows) => {
+                let mut val = rows.into_json();
+                val["ok"] = json!(true);
+                Ok(val)
+            }
             Err(err) => Ok(json!({"ok": false, "message": err.to_string()})),
         }
     }
@@ -691,5 +716,933 @@ impl CozoBackend for RemoteBackend {
 
     fn mode_name(&self) -> &str {
         "remote"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — every CozoBackend method on EmbeddedBackend, real DB, no mocks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_embedded() -> EmbeddedBackend {
+        EmbeddedBackend::new("mem", "", "{}").expect("failed to create in-memory db")
+    }
+
+    /// Seed a test relation with some data.
+    fn seed_data(b: &EmbeddedBackend) {
+        let r = b.query(
+            ":create people {name: String => age: Int, city: String}",
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        );
+        assert!(r.is_ok());
+        let val = r.unwrap();
+        assert_ne!(val.get("ok"), Some(&Value::Bool(false)), "create failed: {}", val);
+
+        let r = b.query(
+            r#"?[name, age, city] <- [
+                ["Alice", 30, "NYC"],
+                ["Bob", 25, "LA"],
+                ["Charlie", 35, "NYC"],
+                ["Diana", 28, "Chicago"],
+                ["Eve", 40, "LA"]
+            ]
+            :put people {name => age, city}"#,
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        );
+        assert!(r.is_ok());
+        let val = r.unwrap();
+        assert_ne!(val.get("ok"), Some(&Value::Bool(false)), "put failed: {}", val);
+    }
+
+    // ── Health ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_health() {
+        let b = new_embedded();
+        let r = b.health().unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["status"], "healthy");
+        assert_eq!(r["mode"], "embedded");
+        assert_eq!(r["engine"], "mem");
+        assert!(r["relation_count"].as_u64().is_some());
+        assert!(r["fixed_rule_count"].as_u64().unwrap() > 0);
+    }
+
+    // ── Query basics ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_query_simple() {
+        let b = new_embedded();
+        let r = b
+            .query(
+                "?[] <- [[1, 'hello'], [2, 'world']]",
+                &BTreeMap::new(),
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        let rows = r["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(r["elapsed_ms"].as_u64().is_some());
+        assert_eq!(r["total_rows"], 2);
+        assert_eq!(r["returned_rows"], 2);
+    }
+
+    #[test]
+    fn test_query_with_params() {
+        let b = new_embedded();
+        let mut params = BTreeMap::new();
+        params.insert("x".to_string(), json!(42));
+        params.insert("y".to_string(), json!("hello"));
+        let r = b
+            .query("?[a, b] <- [[$x, $y]]", &params, false, 0, 0)
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        let rows = r["rows"].as_array().unwrap();
+        assert_eq!(rows[0][0], 42);
+        assert_eq!(rows[0][1], "hello");
+    }
+
+    #[test]
+    fn test_query_immutable_prevents_writes() {
+        let b = new_embedded();
+        seed_data(&b);
+        // Immutable query should succeed for reads
+        let r = b
+            .query(
+                "?[name, age] := *people{name, age}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["rows"].as_array().unwrap().len(), 5);
+
+        // Immutable query should fail for writes
+        let r = b
+            .query(
+                r#"?[name, age, city] <- [["Zara", 22, "SF"]] :put people {name => age, city}"#,
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], false);
+    }
+
+    #[test]
+    fn test_query_limit_offset() {
+        let b = new_embedded();
+        let r = b
+            .query(
+                "?[x] <- [[1], [2], [3], [4], [5]]",
+                &BTreeMap::new(),
+                false,
+                2,
+                1,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["total_rows"], 5);
+        assert_eq!(r["returned_rows"], 2);
+        assert_eq!(r["offset"], 1);
+        assert_eq!(r["limit"], 2);
+        let rows = r["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_query_limit_only() {
+        let b = new_embedded();
+        let r = b
+            .query(
+                "?[x] <- [[1], [2], [3], [4], [5]]",
+                &BTreeMap::new(),
+                false,
+                3,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["total_rows"], 5);
+        assert_eq!(r["returned_rows"], 3);
+    }
+
+    #[test]
+    fn test_query_offset_past_end() {
+        let b = new_embedded();
+        let r = b
+            .query(
+                "?[x] <- [[1], [2], [3]]",
+                &BTreeMap::new(),
+                false,
+                0,
+                100,
+            )
+            .unwrap();
+        assert_eq!(r["total_rows"], 3);
+        assert_eq!(r["returned_rows"], 0);
+    }
+
+    #[test]
+    fn test_query_error_bad_script() {
+        let b = new_embedded();
+        let r = b
+            .query("THIS IS NOT VALID", &BTreeMap::new(), false, 0, 0)
+            .unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["message"].as_str().is_some());
+        assert!(r["elapsed_ms"].as_u64().is_some());
+    }
+
+    // ── Explain ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_explain() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.explain("?[name] := *people{name}").unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["rows"].as_array().is_some());
+        assert!(r["headers"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_explain_invalid_query() {
+        let b = new_embedded();
+        let r = b.explain("GARBAGE QUERY").unwrap();
+        assert_eq!(r["ok"], false);
+    }
+
+    // ── Validate ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_valid_query() {
+        let b = new_embedded();
+        let r = b.validate("?[] <- [[1, 2, 3]]").unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["valid"], true);
+        assert!(r["script"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_validate_invalid_query() {
+        let b = new_embedded();
+        let r = b.validate("NOT VALID SQL").unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["valid"], false);
+        assert!(r["error"].as_str().is_some());
+    }
+
+    // ── Relations & Columns ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_relations_empty() {
+        let b = new_embedded();
+        let r = b.list_relations().unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_list_relations_with_data() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.list_relations().unwrap();
+        assert_eq!(r["ok"], true);
+        let rows = r["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        // First column should be the name
+        assert_eq!(rows[0][0], "people");
+    }
+
+    #[test]
+    fn test_list_columns() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.list_columns("people").unwrap();
+        assert_eq!(r["ok"], true);
+        let rows = r["rows"].as_array().unwrap();
+        assert!(rows.len() >= 3); // name, age, city
+        let headers = r["headers"].as_array().unwrap();
+        assert!(!headers.is_empty());
+    }
+
+    #[test]
+    fn test_list_columns_nonexistent() {
+        let b = new_embedded();
+        let r = b.list_columns("nonexistent").unwrap();
+        assert_eq!(r["ok"], false);
+    }
+
+    // ── Indices ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_indices_empty() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.list_indices("people").unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    #[test]
+    fn test_create_and_list_and_drop_index() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        // Create index
+        let r = b
+            .create_index(
+                "people",
+                "idx_age",
+                &["age".to_string()],
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true, "create index failed: {}", r);
+
+        // List indices — should have our new index
+        let r = b.list_indices("people").unwrap();
+        assert_eq!(r["ok"], true);
+        let rows = r["rows"].as_array().unwrap();
+        let found = rows.iter().any(|row| {
+            row.as_array()
+                .map(|a| a.iter().any(|v| v.as_str() == Some("idx_age")))
+                .unwrap_or(false)
+        });
+        assert!(found, "idx_age not found in indices: {:?}", rows);
+
+        // Drop index
+        let r = b.drop_index("people", "idx_age").unwrap();
+        assert_eq!(r["ok"], true, "drop index failed: {}", r);
+
+        // Verify dropped
+        let r = b.list_indices("people").unwrap();
+        let rows = r["rows"].as_array().unwrap();
+        let found = rows.iter().any(|row| {
+            row.as_array()
+                .map(|a| a.iter().any(|v| v.as_str() == Some("idx_age")))
+                .unwrap_or(false)
+        });
+        assert!(!found, "idx_age should be dropped");
+    }
+
+    // ── Triggers ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_show_triggers() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.show_triggers("people").unwrap();
+        // May succeed or return empty triggers
+        assert_eq!(r["ok"], true);
+    }
+
+    // ── Describe ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_describe_get_and_set() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        // Note: ::describe is defined in the grammar but not wired into sys_script,
+        // so it fails at parse time. This is a pre-existing CozoDB grammar issue.
+        // We test that the backend correctly returns the error without crashing.
+        let r = b
+            .describe_relation("people", Some("A table of people"))
+            .unwrap();
+        // Returns ok:false because ::describe isn't in the parser's sys_script rule
+        assert_eq!(r["ok"], false);
+        assert!(r["message"].as_str().unwrap().contains("parser"));
+
+        // Get (no description) also fails for the same reason
+        let r = b.describe_relation("people", None).unwrap();
+        assert_eq!(r["ok"], false);
+    }
+
+    // ── Full Schema ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_full_schema_empty() {
+        let b = new_embedded();
+        let r = b.full_schema().unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["schema"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_full_schema_with_data() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.full_schema().unwrap();
+        assert_eq!(r["ok"], true);
+        let schema = r["schema"].as_array().unwrap();
+        assert_eq!(schema.len(), 1);
+        let people = &schema[0];
+        assert_eq!(people["name"], "people");
+        assert!(people["columns"].is_object() || people["columns"].is_array());
+    }
+
+    // ── Batch ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_non_transactional() {
+        let b = new_embedded();
+        let queries = vec![
+            ("?[] <- [[1]]".to_string(), BTreeMap::new()),
+            ("?[] <- [[2]]".to_string(), BTreeMap::new()),
+            ("?[] <- [[3]]".to_string(), BTreeMap::new()),
+        ];
+        let r = b.batch(&queries, false).unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["query_count"], 3);
+        let results = r["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        for result in results {
+            assert_eq!(result["ok"], true);
+        }
+    }
+
+    #[test]
+    fn test_batch_transactional_success() {
+        let b = new_embedded();
+        // First create the table
+        seed_data(&b);
+
+        let queries = vec![
+            (
+                r#"?[name, age, city] <- [["Frank", 50, "Boston"]] :put people {name => age, city}"#.to_string(),
+                BTreeMap::new(),
+            ),
+            (
+                r#"?[name, age, city] <- [["Grace", 33, "Denver"]] :put people {name => age, city}"#.to_string(),
+                BTreeMap::new(),
+            ),
+        ];
+        let r = b.batch(&queries, true).unwrap();
+        assert_eq!(r["ok"], true, "batch failed: {}", r);
+        assert_eq!(r["query_count"], 2);
+
+        // Verify both rows were inserted
+        let r = b
+            .query(
+                "?[count(name)] := *people{name}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        let count = r["rows"].as_array().unwrap()[0][0].as_u64().unwrap();
+        assert_eq!(count, 7); // 5 original + 2 new
+    }
+
+    #[test]
+    fn test_batch_transactional_rollback_on_error() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        let queries = vec![
+            (
+                r#"?[name, age, city] <- [["Hank", 45, "Miami"]] :put people {name => age, city}"#.to_string(),
+                BTreeMap::new(),
+            ),
+            (
+                "THIS IS NOT VALID".to_string(),
+                BTreeMap::new(),
+            ),
+        ];
+        let r = b.batch(&queries, true).unwrap();
+        assert_eq!(r["ok"], false, "batch should have failed: {}", r);
+
+        // Hank should NOT be present (transaction rolled back)
+        let r = b
+            .query(
+                "?[name] := *people{name}, name = 'Hank'",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_batch_non_transactional_partial_failure() {
+        let b = new_embedded();
+        let queries = vec![
+            ("?[] <- [[1]]".to_string(), BTreeMap::new()),
+            ("INVALID".to_string(), BTreeMap::new()),
+            ("?[] <- [[3]]".to_string(), BTreeMap::new()),
+        ];
+        let r = b.batch(&queries, false).unwrap();
+        assert_eq!(r["ok"], true);
+        let results = r["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[2]["ok"], true);
+    }
+
+    // ── Running / Kill ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_running() {
+        let b = new_embedded();
+        let r = b.list_running().unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["rows"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_kill_nonexistent() {
+        let b = new_embedded();
+        // Killing a non-existent process should not crash
+        let r = b.kill_running(99999).unwrap();
+        // Cozo returns ok:true even for non-existent kills
+        assert!(r.is_object());
+    }
+
+    // ── Fixed Rules ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_fixed_rules() {
+        let b = new_embedded();
+        let r = b.list_fixed_rules().unwrap();
+        assert_eq!(r["ok"], true);
+        let rows = r["rows"].as_array().unwrap();
+        assert!(rows.len() > 10, "expected many fixed rules, got {}", rows.len());
+    }
+
+    // ── Compact ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_compact() {
+        let b = new_embedded();
+        seed_data(&b);
+        let r = b.compact().unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    // ── Remove Relations ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_remove_relations() {
+        let b = new_embedded();
+        seed_data(&b);
+        assert_eq!(b.list_relations().unwrap()["rows"].as_array().unwrap().len(), 1);
+
+        let r = b.remove_relations(&["people".to_string()]).unwrap();
+        assert_eq!(r["ok"], true);
+
+        assert_eq!(b.list_relations().unwrap()["rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_relation() {
+        let b = new_embedded();
+        let r = b.remove_relations(&["does_not_exist".to_string()]).unwrap();
+        // Cozo may return ok:true even for non-existent removal
+        assert!(r.is_object());
+    }
+
+    // ── Rename Relations ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rename_relations() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        let r = b
+            .rename_relations(&[("people".to_string(), "humans".to_string())])
+            .unwrap();
+        assert_eq!(r["ok"], true, "rename failed: {}", r);
+
+        // Old name should not exist
+        let r = b.list_columns("people").unwrap();
+        assert_eq!(r["ok"], false);
+
+        // New name should work
+        let r = b.list_columns("humans").unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["rows"].as_array().unwrap().len() >= 3);
+
+        // Data should be preserved
+        let r = b
+            .query(
+                "?[count(name)] := *humans{name}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["rows"].as_array().unwrap()[0][0], 5);
+    }
+
+    // ── Access Level ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_access_level() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        // Set to read-only
+        let r = b
+            .set_access_level("read_only", &["people".to_string()])
+            .unwrap();
+        assert_eq!(r["ok"], true, "set access level failed: {}", r);
+
+        // Writes should now fail
+        let r = b
+            .query(
+                r#"?[name, age, city] <- [["Zara", 22, "SF"]] :put people {name => age, city}"#,
+                &BTreeMap::new(),
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], false);
+
+        // Reads should still work
+        let r = b
+            .query(
+                "?[name] := *people{name}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+
+        // Reset to normal
+        let r = b
+            .set_access_level("normal", &["people".to_string()])
+            .unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    // ── Export / Import ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_export_and_import() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        // Export
+        let r = b.export_relations(&["people".to_string()]).unwrap();
+        assert_eq!(r["ok"], true, "export failed: {}", r);
+        let export_data = r["data"].clone();
+        assert!(export_data["people"].is_object(), "missing people data: {}", export_data);
+
+        // Remove original
+        let r = b.remove_relations(&["people".to_string()]).unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(b.list_relations().unwrap()["rows"].as_array().unwrap().len(), 0);
+
+        // Re-create the relation schema first
+        let _ = b.query(
+            ":create people {name: String => age: Int, city: String}",
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        );
+
+        // Import
+        let r = b.import_relations(&export_data).unwrap();
+        assert_eq!(r["ok"], true, "import failed: {}", r);
+
+        // Verify data is back
+        let r = b
+            .query(
+                "?[count(name)] := *people{name}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["rows"].as_array().unwrap()[0][0], 5);
+    }
+
+    #[test]
+    fn test_import_bad_data() {
+        let b = new_embedded();
+        let r = b.import_relations(&json!("not an object")).unwrap();
+        assert_eq!(r["ok"], false);
+    }
+
+    // ── Backup / Import from Backup ─────────────────────────────────────────
+
+    #[test]
+    fn test_backup_and_import_from_backup() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        let backup_path = format!("/tmp/cozo_test_backup_{}.db", std::process::id());
+
+        // Ensure clean
+        let _ = std::fs::remove_file(&backup_path);
+
+        // Backup
+        let r = b.backup(&backup_path).unwrap();
+        assert_eq!(r["ok"], true, "backup failed: {}", r);
+        assert!(
+            std::fs::metadata(&backup_path).is_ok(),
+            "backup file should exist"
+        );
+
+        // Create a fresh DB and import from backup
+        let b2 = new_embedded();
+        let _ = b2.query(
+            ":create people {name: String => age: Int, city: String}",
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        );
+        let r = b2
+            .import_from_backup(&backup_path, &["people".to_string()])
+            .unwrap();
+        assert_eq!(r["ok"], true, "import from backup failed: {}", r);
+
+        // Verify data
+        let r = b2
+            .query(
+                "?[count(name)] := *people{name}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["rows"].as_array().unwrap()[0][0], 5);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&backup_path);
+    }
+
+    // ── Mode Name ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mode_name() {
+        let b = new_embedded();
+        assert_eq!(b.mode_name(), "embedded");
+    }
+
+    // ── Complex multi-step workflow ─────────────────────────────────────────
+
+    #[test]
+    fn test_full_lifecycle() {
+        let b = new_embedded();
+
+        // 1. Health check
+        assert_eq!(b.health().unwrap()["ok"], true);
+
+        // 2. No relations yet
+        assert_eq!(
+            b.list_relations().unwrap()["rows"].as_array().unwrap().len(),
+            0
+        );
+
+        // 3. Create a relation with data
+        seed_data(&b);
+
+        // 4. Verify relation exists
+        let rels = b.list_relations().unwrap();
+        assert_eq!(rels["rows"].as_array().unwrap().len(), 1);
+
+        // 5. Check columns
+        let cols = b.list_columns("people").unwrap();
+        assert!(cols["rows"].as_array().unwrap().len() >= 3);
+
+        // 6. Create index
+        let r = b
+            .create_index("people", "idx_city", &["city".to_string()])
+            .unwrap();
+        assert_eq!(r["ok"], true);
+
+        // 7. Schema should show everything (may include index relation)
+        let schema = b.full_schema().unwrap();
+        assert!(schema["schema"].as_array().unwrap().len() >= 1);
+
+        // 8. Query with filtering
+        let r = b
+            .query(
+                "?[name, age] := *people{name, age, city}, city = 'NYC'",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["rows"].as_array().unwrap().len(), 2); // Alice, Charlie
+
+        // 9. Explain the query
+        let r = b
+            .explain("?[name] := *people{name, city}, city = 'NYC'")
+            .unwrap();
+        assert_eq!(r["ok"], true);
+
+        // 10. Validate
+        let r = b
+            .validate("?[name] := *people{name}")
+            .unwrap();
+        assert_eq!(r["valid"], true);
+
+        // 11. Drop index
+        b.drop_index("people", "idx_city").unwrap();
+
+        // 12. Set description (returns error because ::describe isn't wired in grammar)
+        let r = b.describe_relation("people", Some("People table")).unwrap();
+        assert_eq!(r["ok"], false); // Known grammar issue
+
+        // 13. Compact
+        assert_eq!(b.compact().unwrap()["ok"], true);
+
+        // 14. Remove
+        assert_eq!(
+            b.remove_relations(&["people".to_string()]).unwrap()["ok"],
+            true
+        );
+        assert_eq!(
+            b.list_relations().unwrap()["rows"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    // ── Multiple relations ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_multiple_relations() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        // Create a second relation
+        b.query(
+            ":create cities {name: String => population: Int}",
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+        b.query(
+            r#"?[name, population] <- [["NYC", 8000000], ["LA", 4000000], ["Chicago", 2700000]]
+            :put cities {name => population}"#,
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+
+        // Should have 2 relations
+        let rels = b.list_relations().unwrap();
+        assert_eq!(rels["rows"].as_array().unwrap().len(), 2);
+
+        // Schema should cover both
+        let schema = b.full_schema().unwrap();
+        assert_eq!(schema["schema"].as_array().unwrap().len(), 2);
+
+        // Join query across relations
+        let r = b
+            .query(
+                "?[name, age, population] := *people{name, age, city}, *cities{name: city, population}",
+                &BTreeMap::new(),
+                true,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        // Alice(NYC), Bob(LA), Charlie(NYC), Diana(Chicago), Eve(LA)
+        assert_eq!(r["rows"].as_array().unwrap().len(), 5);
+
+        // Rename one
+        b.rename_relations(&[("cities".to_string(), "metropolis".to_string())])
+            .unwrap();
+
+        let rels = b.list_relations().unwrap();
+        let names: Vec<&str> = rels["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"people"));
+        assert!(names.contains(&"metropolis"));
+        assert!(!names.contains(&"cities"));
+    }
+
+    // ── Export multiple relations ────────────────────────────────────────────
+
+    #[test]
+    fn test_export_multiple() {
+        let b = new_embedded();
+        seed_data(&b);
+
+        b.query(
+            ":create tags {label: String}",
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+        b.query(
+            r#"?[label] <- [["active"], ["admin"]] :put tags {label}"#,
+            &BTreeMap::new(),
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let r = b
+            .export_relations(&["people".to_string(), "tags".to_string()])
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["data"]["people"].is_object());
+        assert!(r["data"]["tags"].is_object());
+    }
+
+    // ── Batch with parameters ───────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_with_params() {
+        let b = new_embedded();
+        let mut p1 = BTreeMap::new();
+        p1.insert("val".to_string(), json!(100));
+        let mut p2 = BTreeMap::new();
+        p2.insert("val".to_string(), json!(200));
+
+        let queries = vec![
+            ("?[x] <- [[$val]]".to_string(), p1),
+            ("?[x] <- [[$val]]".to_string(), p2),
+        ];
+        let r = b.batch(&queries, false).unwrap();
+        assert_eq!(r["ok"], true);
+        let results = r["results"].as_array().unwrap();
+        assert_eq!(results[0]["rows"].as_array().unwrap()[0][0], 100);
+        assert_eq!(results[1]["rows"].as_array().unwrap()[0][0], 200);
     }
 }

@@ -77,7 +77,11 @@ pub async fn list_relations(State(st): State<DbState>) -> (StatusCode, Json<serd
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -106,7 +110,11 @@ pub async fn list_columns(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -135,7 +143,11 @@ pub async fn list_indices(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -164,7 +176,11 @@ pub async fn show_triggers(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -200,7 +216,11 @@ pub async fn describe_relation(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -318,7 +338,11 @@ pub async fn explain_query(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -430,6 +454,7 @@ pub async fn api_query(
 
             let returned_rows = rows.rows.len();
             let mut response = rows.into_json();
+            response["ok"] = json!(true);
             response["elapsed_ms"] = json!(elapsed_ms);
             response["total_rows"] = json!(total_rows);
             response["returned_rows"] = json!(returned_rows);
@@ -469,7 +494,11 @@ pub async fn list_running(State(st): State<DbState>) -> (StatusCode, Json<serde_
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -498,7 +527,11 @@ pub async fn kill_running(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -528,7 +561,11 @@ pub async fn list_fixed_rules(
     .await;
 
     match result {
-        Ok(Ok(rows)) => (StatusCode::OK, rows.into_json().into()),
+        Ok(Ok(rows)) => {
+            let mut val = rows.into_json();
+            val["ok"] = json!(true);
+            (StatusCode::OK, val.into())
+        }
         Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "message": err.to_string()}).into(),
@@ -717,7 +754,11 @@ pub async fn batch_query(
                     .map(|(k, v)| (k.clone(), DataValue::from(v.clone())))
                     .collect();
                 match tx.run_script(&q.script, params) {
-                    Ok(rows) => results.push(rows.into_json()),
+                    Ok(rows) => {
+                        let mut val = rows.into_json();
+                        val["ok"] = json!(true);
+                        results.push(val);
+                    }
                     Err(err) => {
                         let _ = tx.abort();
                         return Err(err.to_string());
@@ -735,7 +776,11 @@ pub async fn batch_query(
                     .map(|(k, v)| (k.clone(), DataValue::from(v.clone())))
                     .collect();
                 match db.run_script(&q.script, params, ScriptMutability::Mutable) {
-                    Ok(rows) => results.push(rows.into_json()),
+                    Ok(rows) => {
+                        let mut val = rows.into_json();
+                        val["ok"] = json!(true);
+                        results.push(val);
+                    }
                     Err(err) => results.push(json!({"ok": false, "message": err.to_string()})),
                 }
             }
