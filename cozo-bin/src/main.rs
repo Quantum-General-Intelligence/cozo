@@ -13,9 +13,12 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 use env_logger::Env;
 
+use crate::cli::{cli_main, CliArgs};
 use crate::repl::{repl_main, ReplArgs};
 use crate::server::{server_main, ServerArgs};
 
+mod api;
+mod cli;
 mod client;
 mod repl;
 mod server;
@@ -30,8 +33,12 @@ struct AppArgs {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start the CozoDB HTTP server
     Server(ServerArgs),
+    /// Start an interactive REPL session
     Repl(ReplArgs),
+    /// CLI client for interacting with a running CozoDB server
+    Cli(CliArgs),
 }
 
 fn main() {
@@ -50,41 +57,11 @@ fn main() {
                 exit(-1);
             }
         }
+        Commands::Cli(args) => {
+            if let Err(e) = cli_main(args) {
+                eprintln!("{e}");
+                exit(1);
+            }
+        }
     };
-
-    // if args.repl {
-
-    // } else {
-
-    // server_main(args, db)
-    // }
 }
-
-// fn server_main(args: Server, db: DbInstance) {
-//
-//     let addr = if Ipv6Addr::from_str(&args.bind).is_ok() {
-//         format!("[{}]:{}", args.bind, args.port)
-//     } else {
-//         format!("{}:{}", args.bind, args.port)
-//     };
-//     println!(
-//         "Database ({} backend) web API running at http://{}",
-//         args.engine, addr
-//     );
-//     println!("The auth file is at {conf_path}");
-//     rouille::start_server(addr, move |request| {
-//         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
-//         let log_ok = |req: &Request, _resp: &Response, elap: std::time::Duration| {
-//             info!("{} {} {} {:?}", now, req.method(), req.raw_url(), elap);
-//         };
-//         let log_err = |req: &Request, elap: std::time::Duration| {
-//             error!(
-//                 "{} Handler panicked: {} {} {:?}",
-//                 now,
-//                 req.method(),
-//                 req.raw_url(),
-//                 elap
-//             );
-//         };
-//     });
-// }

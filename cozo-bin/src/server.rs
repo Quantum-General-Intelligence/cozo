@@ -37,6 +37,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use cozo::{DataValue, DbInstance, format_error_as_json, MultiTransaction, NamedRows, ScriptMutability, SimpleFixedRule};
 
+use crate::api;
+
 #[derive(Args, Debug)]
 pub(crate) struct ServerArgs {
     /// Database engine, can be `mem`, `sqlite`, `rocksdb` and others.
@@ -69,12 +71,13 @@ pub(crate) struct ServerArgs {
 }
 
 #[derive(Clone)]
-struct DbState {
-    db: DbInstance,
-    rule_senders: Arc<Mutex<BTreeMap<u32, crossbeam::channel::Sender<miette::Result<NamedRows>>>>>,
-    rule_counter: Arc<AtomicU32>,
-    tx_counter: Arc<AtomicU32>,
-    txs: Arc<Mutex<BTreeMap<u32, Arc<MultiTransaction>>>>,
+pub(crate) struct DbState {
+    pub db: DbInstance,
+    pub engine: String,
+    pub rule_senders: Arc<Mutex<BTreeMap<u32, crossbeam::channel::Sender<miette::Result<NamedRows>>>>>,
+    pub rule_counter: Arc<AtomicU32>,
+    pub tx_counter: Arc<AtomicU32>,
+    pub txs: Arc<Mutex<BTreeMap<u32, Arc<MultiTransaction>>>>,
 }
 
 #[derive(Clone)]
@@ -230,6 +233,7 @@ pub(crate) async fn server_main(args: ServerArgs) {
 
     let state = DbState {
         db,
+        engine: args.engine.clone(),
         rule_senders: Default::default(),
         rule_counter: Default::default(),
         tx_counter: Default::default(),
@@ -241,6 +245,7 @@ pub(crate) async fn server_main(args: ServerArgs) {
         .allow_headers([header::CONTENT_TYPE, HeaderName::from_static("x-cozo-auth")]);
 
     let app = Router::new()
+        // Legacy API endpoints
         .route("/text-query", post(text_query))
         .route("/export/:relations", get(export_relations))
         .route("/import", put(import_relations))
@@ -254,6 +259,27 @@ pub(crate) async fn server_main(args: ServerArgs) {
         ) // +keep alive
         .route("/transact", post(start_transact))
         .route("/transact/:id", post(transact_query).put(finish_query))
+        // Agent-ready API endpoints
+        .route("/api/health", get(api::health))
+        .route("/api/endpoints", get(api::list_endpoints))
+        .route("/api/schema", get(api::full_schema))
+        .route("/api/relations", get(api::list_relations))
+        .route("/api/relations/:name/columns", get(api::list_columns))
+        .route("/api/relations/:name/indices", get(api::list_indices).post(api::create_index))
+        .route("/api/relations/:name/indices/:index_name", axum::routing::delete(api::drop_index))
+        .route("/api/relations/:name/triggers", get(api::show_triggers))
+        .route("/api/relations/:name/describe", post(api::describe_relation))
+        .route("/api/query", post(api::api_query))
+        .route("/api/explain", post(api::explain_query))
+        .route("/api/validate", post(api::validate_query))
+        .route("/api/batch", post(api::batch_query))
+        .route("/api/running", get(api::list_running))
+        .route("/api/running/:id", axum::routing::delete(api::kill_running))
+        .route("/api/fixed-rules", get(api::list_fixed_rules))
+        .route("/api/compact", post(api::compact_db))
+        .route("/api/remove-relations", post(api::remove_relations))
+        .route("/api/rename-relations", post(api::rename_relations))
+        .route("/api/access-level", post(api::set_access_level))
         .with_state(state)
         .layer(AsyncRequireAuthorizationLayer::new(auth_obj))
         .fallback(not_found)
